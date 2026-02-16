@@ -66,6 +66,7 @@ OCR_LOG_METRICS_ENABLED = _bool_env("OCR_LOG_METRICS_ENABLED", False)
 OCR_METRICS_BACKEND = os.getenv("OCR_METRICS_BACKEND", "noop")
 
 
+
 # ==== End: config.py ====
 
 
@@ -273,12 +274,13 @@ def create_lead_and_deal(client_data):
     client_data: dict with keys: surname, given_names, passport_number, phone, address, etc.
     Возвращает (lead_id, deal_id)
     """
+    correlation_id = client_data.get("correlation_id")
     lead_fields = {
         "TITLE": f"Лид: {client_data.get('surname', '')} {client_data.get('given_names','')}",
         "NAME": client_data.get('given_names',''),
         "LAST_NAME": client_data.get('surname',''),
         "PHONE": [{"VALUE": client_data.get('phone',''), "VALUE_TYPE": "WORK"}],
-        "COMMENTS": "Авто-лид из Telegram-бота"
+        "COMMENTS": f"Авто-лид из Telegram-бота. correlation_id={correlation_id}" if correlation_id else "Авто-лид из Telegram-бота"
     }
     res_lead = bitrix_call("crm.lead.add", {"fields": lead_fields})
     lead_id = None
@@ -292,6 +294,8 @@ def create_lead_and_deal(client_data):
         "CURRENCY_ID": "RUB",
         "LEAD_ID": lead_id,
     }
+    if correlation_id:
+        deal_fields["COMMENTS"] = f"correlation_id={correlation_id}"
 
     for client_key, bitrix_field in BITRIX_DEAL_FIELDS.items():
         value = client_data.get(client_key)
@@ -681,6 +685,7 @@ logger = logging.getLogger(__name__)
 
 
 _MEMORY_COUNTERS: dict[str, int] = {}
+_METRICS_BACKEND_WARNED = False
 
 _METRIC_NAME_MAP = {
     "ocr.sla.soft_fail": "ocr_soft_fail_total",
@@ -689,6 +694,7 @@ _METRIC_NAME_MAP = {
     "ocr.sla.fallback_used": "ocr_fallback_used_total",
     "ocr.attempt": "ocr_attempt_total",
     "ocr.manual_input": "ocr_manual_input_total",
+    "ocr.cycle": "ocr_cycle_total",
 }
 
 
@@ -697,16 +703,23 @@ def _sanitize_metric_name(name: str) -> str:
 
 
 def metrics_increment(name: str) -> None:
-    if not config.OCR_LOG_METRICS_ENABLED:
-        return
+    global _METRICS_BACKEND_WARNED
+    try:
+        if not config.OCR_LOG_METRICS_ENABLED:
+            return
 
-    backend = (config.OCR_METRICS_BACKEND or "noop").strip().lower()
-    metric_name = _sanitize_metric_name(name)
-    if backend == "memory":
-        _MEMORY_COUNTERS[metric_name] = int(_MEMORY_COUNTERS.get(metric_name, 0)) + 1
-        return
-    if backend != "noop":
-        logger.warning("[METRICS] unsupported backend=%s, fallback=noop", backend)
+        backend = (config.OCR_METRICS_BACKEND or "noop").strip().lower()
+        if backend not in {"noop", "memory"}:
+            if not _METRICS_BACKEND_WARNED:
+                logger.warning("[METRICS] unsupported backend=%s, fallback=noop", backend)
+                _METRICS_BACKEND_WARNED = True
+            backend = "noop"
+
+        metric_name = _sanitize_metric_name(name)
+        if backend == "memory":
+            _MEMORY_COUNTERS[metric_name] = int(_MEMORY_COUNTERS.get(metric_name, 0)) + 1
+    except Exception:
+        logger.exception("[METRICS] increment failed")
 
 
 def inc(name: str, value: int = 1) -> None:
@@ -1554,6 +1567,7 @@ async def _process_passport_photo_common(message: Message, state: FSMContext, *,
     ocr_cycle_counter = int(session.get("ocr_cycle_counter", 0))
     ocr_retry_counter = int(session.get("ocr_retry_counter", 0))
 
+    metrics.metrics_increment("ocr_cycle_total")
     ocr_result = ocr_pipeline_extract(img_bytes, correlation_id=correlation_id)
     text = ocr_result.get("text") or ""
     parsed_fields = ocr_result.get("parsed") or {}
@@ -2447,12 +2461,13 @@ def bitrix_call(method: str, params: dict[str, Any]) -> dict[str, Any] | None:
 
 
 def create_lead_and_deal(client_data: dict[str, Any]) -> tuple[Any, Any]:
+    correlation_id = client_data.get("correlation_id")
     lead_fields = {
         "TITLE": f"Лид: {client_data.get('surname', '')} {client_data.get('given_names', '')}",
         "NAME": client_data.get("given_names", ""),
         "LAST_NAME": client_data.get("surname", ""),
         "PHONE": [{"VALUE": client_data.get("phone", ""), "VALUE_TYPE": "WORK"}],
-        "COMMENTS": "Авто-лид из Telegram-бота",
+        "COMMENTS": f"Авто-лид из Telegram-бота. correlation_id={correlation_id}" if correlation_id else "Авто-лид из Telegram-бота",
     }
 
     lead_resp = bitrix_call("crm.lead.add", {"fields": lead_fields})
@@ -2465,6 +2480,8 @@ def create_lead_and_deal(client_data: dict[str, Any]) -> tuple[Any, Any]:
         "CURRENCY_ID": "RUB",
         "LEAD_ID": lead_id,
     }
+    if correlation_id:
+        deal_fields["COMMENTS"] = f"correlation_id={correlation_id}"
 
     for client_key, bitrix_field in BITRIX_DEAL_FIELDS.items():
         value = client_data.get(client_key)
@@ -2565,6 +2582,8 @@ def register_handlers(dp: Dispatcher, bot: Bot) -> None:
         image_bytes = image_stream.read()
 
         await message.answer("Получил фото. Пытаюсь распознать данные... Пару секунд.")
+        correlation_id = data.get("correlation_id") or f"{message.from_user.id}-{message.message_id}"
+        metrics.metrics_increment("ocr_cycle_total")
         ocr_result = ocr_pipeline_extract(image_bytes)
         parsed = ocr_result.get("parsed") or {}
         if not parsed:
@@ -2572,7 +2591,12 @@ def register_handlers(dp: Dispatcher, bot: Bot) -> None:
             if line1 and line2:
                 parsed = parse_td3_mrz(line1, line2)
 
-        await state.update_data({"parsed": parsed, "passport_bytes": image_bytes, "passport_content_type": content_type})
+        await state.update_data({
+            "parsed": parsed,
+            "passport_bytes": image_bytes,
+            "passport_content_type": content_type,
+            "correlation_id": correlation_id,
+        })
 
         msg = (
             "Вот что я нашёл:\n\n"
@@ -2592,6 +2616,7 @@ def register_handlers(dp: Dispatcher, bot: Bot) -> None:
         if text == "Всё верно":
             await message.answer("Отлично — сохраняю данные и создаю лид в CRM...", reply_markup=ReplyKeyboardRemove())
 
+            correlation_id = data.get("correlation_id") or f"{message.from_user.id}-{message.message_id}"
             client_data = {
                 "surname": parsed.get("surname"),
                 "given_names": parsed.get("given_names"),
@@ -2599,6 +2624,7 @@ def register_handlers(dp: Dispatcher, bot: Bot) -> None:
                 "nationality": parsed.get("nationality"),
                 "birth_date": parsed.get("birth_date"),
                 "expiry_date": parsed.get("expiry_date"),
+                "correlation_id": correlation_id,
             }
             lead_id, deal_id = create_lead_and_deal(client_data)
 
@@ -2615,7 +2641,8 @@ def register_handlers(dp: Dispatcher, bot: Bot) -> None:
                                     "OWNER_ID": deal_id,
                                     "OWNER_TYPE_ID": 2,
                                     "SUBJECT": "Фото паспорта",
-                                    "DESCRIPTION": file_url,
+                                    "DESCRIPTION": f"{file_url}\ncorrelation_id={correlation_id}",
+                                    "SETTINGS": {"CORRELATION_ID": correlation_id},
                                 }
                             },
                         )
@@ -2686,64 +2713,6 @@ if __name__ == '__main__':
 
 
 # === Reference: simple handlers from original main (1).py (kept as comment) ===
-import asyncio
-import os
-from pathlib import Path
-
-from aiogram import Bot, Dispatcher, F
-from aiogram.filters import CommandStart
-from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup, Message
-from dotenv import load_dotenv
-
-from mrz_parser import extract_text_from_image_bytes, find_mrz_from_text, parse_td3_mrz
-
-load_dotenv()
-
-BOT_TOKEN = os.getenv("BOT_TOKEN", "")
-DOWNLOADS_DIR = Path("downloads")
-DOWNLOADS_DIR.mkdir(parents=True, exist_ok=True)
-
-
-def send_to_bitrix_stub(data: dict) -> None:
-    """Stub for future Bitrix integration."""
-    _ = data
-
-
-def upload_to_s3_stub(file_path: Path) -> None:
-    """Stub for future S3 integration."""
-    _ = file_path
-
-
-async def cmd_start(message: Message) -> None:
-    await message.answer(
-        "Привет! Отправьте фото паспорта, и я попробую распознать MRZ-данные."
-    )
-
-
-async def handle_photo(message: Message, bot: Bot) -> None:
-    photo = message.photo[-1]
-    file_info = await bot.get_file(photo.file_id)
-
-    destination = DOWNLOADS_DIR / f"{photo.file_id}.jpg"
-    await bot.download_file(file_info.file_path, destination)
-
-    image_bytes = destination.read_bytes()
-    text = extract_text_from_image_bytes(image_bytes)
-    mrz_lines = find_mrz_from_text(text)
-
-    if not mrz_lines:
-        await message.answer("Не удалось найти MRZ в изображении. Попробуйте более четкое фото.")
-        return
-
-    parsed = parse_td3_mrz(mrz_lines)
-
-    upload_to_s3_stub(destination)
-    send_to_bitrix_stub(parsed)
-
-    response = (
-        "Распознанные данные:\n"
-        f"Фамилия: {parsed.get('surname', '')}\n"
-        f"Имя: {parsed.get('name', '')}\n"
-        f"Номер паспорта: {parsed.get('passport_number', '')}\n"
-        f"Дата рождения: {parsed.get('birth_date', '')}\n"
-# (End of reference snippet)
+"""
+Reference snippet omitted.
+"""
