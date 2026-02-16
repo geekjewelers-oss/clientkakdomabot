@@ -675,99 +675,47 @@ def build_ocr_quality_report(mrz_data: dict, blur: float, exposure: float) -> di
 import logging
 from typing import Any
 
+import config
 
 logger = logging.getLogger(__name__)
 
 
-_PROM_COUNTERS: dict[str, Any] = {}
-_PROM_GAUGES: dict[str, Any] = {}
-_STATSD_CLIENT: Any = None
-_STATSD_INIT_DONE = False
+_MEMORY_COUNTERS: dict[str, int] = {}
 
 _METRIC_NAME_MAP = {
-    "ocr.sla.soft_fail": "ocr_sla_soft_fail_total",
-    "ocr.sla.auto_accept": "ocr_sla_auto_accept_total",
+    "ocr.sla.soft_fail": "ocr_soft_fail_total",
+    "ocr.sla.auto_accept": "ocr_auto_accept_total",
     "ocr.sla.breach": "ocr_sla_breach_total",
-    "ocr.sla.fallback_used": "ocr_sla_fallback_total",
+    "ocr.sla.fallback_used": "ocr_fallback_used_total",
+    "ocr.attempt": "ocr_attempt_total",
+    "ocr.manual_input": "ocr_manual_input_total",
 }
 
 
 def _sanitize_metric_name(name: str) -> str:
-    return _METRIC_NAME_MAP.get(name, name.replace(".", "_"))
+    return _METRIC_NAME_MAP.get(name, name)
 
 
-def _init_statsd() -> Any:
-    global _STATSD_CLIENT, _STATSD_INIT_DONE
-    if _STATSD_INIT_DONE:
-        return _STATSD_CLIENT
+def metrics_increment(name: str) -> None:
+    if not config.OCR_LOG_METRICS_ENABLED:
+        return
 
-    _STATSD_INIT_DONE = True
-    try:
-        from statsd import StatsClient
-
-        _STATSD_CLIENT = StatsClient()
-    except Exception as exc:
-        logger.warning("[METRICS] statsd init failed: %s", exc)
-        _STATSD_CLIENT = None
-    return _STATSD_CLIENT
+    backend = (config.OCR_METRICS_BACKEND or "noop").strip().lower()
+    metric_name = _sanitize_metric_name(name)
+    if backend == "memory":
+        _MEMORY_COUNTERS[metric_name] = int(_MEMORY_COUNTERS.get(metric_name, 0)) + 1
+        return
+    if backend != "noop":
+        logger.warning("[METRICS] unsupported backend=%s, fallback=noop", backend)
 
 
 def inc(name: str, value: int = 1) -> None:
-    if not config.OCR_LOG_METRICS_ENABLED:
-        return
-
-    backend = (config.OCR_METRICS_BACKEND or "noop").strip().lower()
-    if backend == "prometheus":
-        prom_name = _sanitize_metric_name(name)
-        try:
-            from prometheus_client import Counter
-
-            counter = _PROM_COUNTERS.get(prom_name)
-            if counter is None:
-                counter = Counter(prom_name, f"Counter for {name}")
-                _PROM_COUNTERS[prom_name] = counter
-            counter.inc(value)
-        except Exception as exc:
-            logger.warning("[METRICS] prometheus inc failed for %s: %s", name, exc)
-        return
-
-    if backend == "statsd":
-        client = _init_statsd()
-        if client is None:
-            return
-        try:
-            client.incr(name, value)
-        except Exception as exc:
-            logger.warning("[METRICS] statsd inc failed for %s: %s", name, exc)
+    for _ in range(max(0, int(value))):
+        metrics_increment(name)
 
 
 def gauge(name: str, value: float) -> None:
-    if not config.OCR_LOG_METRICS_ENABLED:
-        return
-
-    backend = (config.OCR_METRICS_BACKEND or "noop").strip().lower()
-    if backend == "prometheus":
-        gauge_name = _sanitize_metric_name(name)
-        try:
-            from prometheus_client import Gauge
-
-            metric = _PROM_GAUGES.get(gauge_name)
-            if metric is None:
-                metric = Gauge(gauge_name, f"Gauge for {name}")
-                _PROM_GAUGES[gauge_name] = metric
-            metric.set(value)
-        except Exception as exc:
-            logger.warning("[METRICS] prometheus gauge failed for %s: %s", name, exc)
-        return
-
-    if backend == "statsd":
-        client = _init_statsd()
-        if client is None:
-            return
-        try:
-            client.gauge(name, value)
-        except Exception as exc:
-            logger.warning("[METRICS] statsd gauge failed for %s: %s", name, exc)
+    _ = (name, value)
 
 
 # ==== End: metrics.py ====
@@ -964,14 +912,14 @@ def _soft_fail_response(
         fallback_used=bool(used_fallback_provider),
     )
 
-    metrics_inc: list[str] = ["ocr.sla.soft_fail"]
+    metrics_inc: list[str] = ["ocr_attempt_total", "ocr_soft_fail_total"]
     metrics.inc("ocr.sla.soft_fail")
     if used_fallback_provider:
         metrics.inc("ocr.sla.fallback_used")
-        metrics_inc.append("ocr.sla.fallback_used")
+        metrics_inc.append("ocr_fallback_used_total")
     if sla_breach:
         metrics.inc("ocr.sla.breach")
-        metrics_inc.append("ocr.sla.breach")
+        metrics_inc.append("ocr_sla_breach_total")
 
     return {
         "text": "",
@@ -988,6 +936,7 @@ def _soft_fail_response(
         "timeout_flag": timeout_flag,
         "retry_reason_flags": retry_reason_flags,
         "sla_breach": sla_breach,
+        "sla_breach_flag": sla_breach,
         "correlation_id": correlation_id,
         "passport_hash": None,
         "passport_mrz_len": 0,
@@ -997,6 +946,7 @@ def _soft_fail_response(
 
 
 def ocr_pipeline_extract(img_bytes: bytes, correlation_id: str | None = None) -> dict[str, Any]:
+    metrics.inc("ocr.attempt")
     started_at = time.monotonic()
     gray = _decode_gray_image(img_bytes)
     local_attempts = 0
@@ -1106,13 +1056,13 @@ def ocr_pipeline_extract(img_bytes: bytes, correlation_id: str | None = None) ->
     else:
         decision_branch = "soft_fail"
 
-    metrics_inc: list[str] = []
+    metrics_inc: list[str] = ["ocr_attempt_total"]
     if used_fallback_provider:
         metrics.inc("ocr.sla.fallback_used")
-        metrics_inc.append("ocr.sla.fallback_used")
+        metrics_inc.append("ocr_fallback_used_total")
     if sla_breach:
         metrics.inc("ocr.sla.breach")
-        metrics_inc.append("ocr.sla.breach")
+        metrics_inc.append("ocr_sla_breach_total")
 
     retry_reason_flags = _build_retry_reason_flags(
         quality=quality,
@@ -1123,10 +1073,10 @@ def ocr_pipeline_extract(img_bytes: bytes, correlation_id: str | None = None) ->
 
     if decision_branch == "auto_accept":
         metrics.inc("ocr.sla.auto_accept")
-        metrics_inc.append("ocr.sla.auto_accept")
+        metrics_inc.append("ocr_auto_accept_total")
     elif decision_branch == "soft_fail":
         metrics.inc("ocr.sla.soft_fail")
-        metrics_inc.append("ocr.sla.soft_fail")
+        metrics_inc.append("ocr_soft_fail_total")
 
     mrz_lines = last_result.get("mrz_lines")
     line1 = mrz_lines[0] if mrz_lines else None
@@ -1143,6 +1093,7 @@ def ocr_pipeline_extract(img_bytes: bytes, correlation_id: str | None = None) ->
         "timeout_flag": timeout_flag,
         "retry_reason_flags": retry_reason_flags,
         "sla_breach": sla_breach,
+        "sla_breach_flag": sla_breach,
         "correlation_id": correlation_id,
         "passport_hash": passport_hash,
         "passport_mrz_len": passport_mrz_len,
@@ -1206,6 +1157,7 @@ router = Router(name="registration")
 def _new_session() -> dict[str, Any]:
     return {
         "flow": "registration",
+        "correlation_id": str(uuid4()),
         "manager_id": None,
         "district": None,
         "address": None,
@@ -1217,8 +1169,21 @@ def _new_session() -> dict[str, Any]:
         "payment": {},
         "ocr_cycle_counter": 0,
         "ocr_retry_counter": 0,
-        "last_ocr_decision": None,
+        "last_ocr_decision": {},
+        "last_retry_reason_flags": {},
     }
+
+
+def _ensure_session_hardening(session: dict[str, Any]) -> dict[str, Any]:
+    if not session.get("correlation_id"):
+        session["correlation_id"] = str(uuid4())
+    session.setdefault("ocr_cycle_counter", 0)
+    session.setdefault("ocr_retry_counter", 0)
+    if not isinstance(session.get("last_ocr_decision"), dict):
+        session["last_ocr_decision"] = {}
+    if not isinstance(session.get("last_retry_reason_flags"), dict):
+        session["last_retry_reason_flags"] = {}
+    return session
 
 
 def _session_summary(session: dict[str, Any]) -> str:
@@ -1288,7 +1253,10 @@ def _parse_manual_passport_input(raw_text: str) -> dict[str, str] | None:
 
 async def _get_session(state: FSMContext) -> dict[str, Any]:
     data = await state.get_data()
-    return data.get("session", _new_session())
+    session = data.get("session", _new_session())
+    session = _ensure_session_hardening(session)
+    await state.update_data(session=session)
+    return session
 
 
 async def _go_to_step(
@@ -1567,6 +1535,7 @@ async def process_passport_not_photo(message: Message) -> None:
 
 async def _process_passport_photo_common(message: Message, state: FSMContext, *, source_state: str) -> None:
     session = await _get_session(state)
+    session = _ensure_session_hardening(session)
     passport_index = session.get("current_passport_index", 1)
     logger.info("FSM step entered: %s | passport index=%s", source_state, passport_index)
 
@@ -1581,6 +1550,9 @@ async def _process_passport_photo_common(message: Message, state: FSMContext, *,
         correlation_id = str(uuid4())
         session["correlation_id"] = correlation_id
         await state.update_data(session=session)
+
+    ocr_cycle_counter = int(session.get("ocr_cycle_counter", 0))
+    ocr_retry_counter = int(session.get("ocr_retry_counter", 0))
 
     ocr_result = ocr_pipeline_extract(img_bytes, correlation_id=correlation_id)
     text = ocr_result.get("text") or ""
@@ -1608,8 +1580,23 @@ async def _process_passport_photo_common(message: Message, state: FSMContext, *,
     session["passport_quality"] = quality
     session["passport_confidence"] = conf
     session["passport_needs_retry"] = bool(quality.get("needs_retry", False))
-    session["last_ocr_decision"] = decision_branch
+    session["last_ocr_decision"] = {
+        "correlation_id": correlation_id,
+        "passport_index": passport_index,
+        "ocr_cycle_counter": ocr_cycle_counter,
+        "ocr_retry_counter": ocr_retry_counter,
+        "attempt_local_count": local_attempts,
+        "attempt_fallback_count": fallback_attempts,
+        "used_fallback_provider": used_fallback_provider,
+        "decision_branch": decision_branch,
+        "confidence": conf,
+        "total_elapsed_ms": total_elapsed_ms,
+        "timeout_flag": timeout_flag,
+        "sla_breach_flag": sla_breach,
+        "passport_hash": passport_hash,
+    }
     session["ocr_retry_reason_flags"] = retry_reason_flags
+    session["last_retry_reason_flags"] = retry_reason_flags
     session["ocr_retry_counter"] = int(session.get("ocr_retry_counter", 0)) + 1
 
     manual_mode_triggered = False
@@ -1633,24 +1620,27 @@ async def _process_passport_photo_common(message: Message, state: FSMContext, *,
 
     logger.info("[OCR] handler stage: source=%s, confidence=%s, text_len=%d", source, confidence, len(text))
 
-    if decision_branch == "soft_fail" and "ocr.sla.soft_fail" not in metrics_inc:
+    if decision_branch == "soft_fail" and "ocr_soft_fail_total" not in metrics_inc:
         metrics.inc("ocr.sla.soft_fail")
-        metrics_inc.append("ocr.sla.soft_fail")
-    if decision_branch == "auto_accept" and "ocr.sla.auto_accept" not in metrics_inc:
+        metrics_inc.append("ocr_soft_fail_total")
+    if decision_branch == "auto_accept" and "ocr_auto_accept_total" not in metrics_inc:
         metrics.inc("ocr.sla.auto_accept")
-        metrics_inc.append("ocr.sla.auto_accept")
-    if used_fallback_provider and "ocr.sla.fallback_used" not in metrics_inc:
+        metrics_inc.append("ocr_auto_accept_total")
+    if used_fallback_provider and "ocr_fallback_used_total" not in metrics_inc:
         metrics.inc("ocr.sla.fallback_used")
-        metrics_inc.append("ocr.sla.fallback_used")
-    if sla_breach and "ocr.sla.breach" not in metrics_inc:
+        metrics_inc.append("ocr_fallback_used_total")
+    if sla_breach and "ocr_sla_breach_total" not in metrics_inc:
         metrics.inc("ocr.sla.breach")
-        metrics_inc.append("ocr.sla.breach")
+        metrics_inc.append("ocr_sla_breach_total")
 
     ocr_sla_log = {
         "timestamp": datetime.now(timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z"),
         "level": "INFO",
         "logger": "OCR_SLA_DECISION",
         "correlation_id": correlation_id,
+        "passport_index": passport_index,
+        "ocr_cycle_counter": ocr_cycle_counter,
+        "ocr_retry_counter": ocr_retry_counter,
         "deal_id": session.get("deal_id"),
         "lead_id": session.get("lead_id"),
         "passport_hash": passport_hash,
@@ -1659,14 +1649,16 @@ async def _process_passport_photo_common(message: Message, state: FSMContext, *,
         "attempt_fallback_count": fallback_attempts,
         "total_elapsed_ms": total_elapsed_ms,
         "decision_branch": decision_branch,
+        "confidence": conf,
         "used_fallback_provider": used_fallback_provider,
         "timeout_flag": timeout_flag,
         "sla_breach": sla_breach,
+        "sla_breach_flag": sla_breach,
         "retry_reason_flags": retry_reason_flags,
         "metrics_inc": metrics_inc,
         "logger_version": logger_version,
     }
-    logger.info(json.dumps(ocr_sla_log, ensure_ascii=False))
+    logger.info("OCR_SLA_DECISION", extra=ocr_sla_log)
 
     if decision_branch == "soft_fail" or timeout_flag or quality.get("needs_retry"):
         reasons = _retry_reasons_from_flags(retry_reason_flags) or _quality_retry_reasons(quality)
@@ -1719,6 +1711,7 @@ async def _process_passport_photo_common(message: Message, state: FSMContext, *,
         "photo_file_id": photo.file_id,
         "parsed": parsed,
         "mrz_lines": mrz_lines,
+        "passport_hash": passport_hash,
         "ocr_source": source,
         "ocr_confidence": confidence,
         "ocr_quality": quality,
@@ -1781,7 +1774,9 @@ async def process_passport_rescan_photo(message: Message, state: FSMContext) -> 
 @router.message(Form.manual_input_mode)
 async def process_manual_input_mode(message: Message, state: FSMContext) -> None:
     session = await _get_session(state)
+    session = _ensure_session_hardening(session)
     passport_index = session.get("current_passport_index", 1)
+    correlation_id = session.get("correlation_id")
     parsed = _parse_manual_passport_input((message.text or "").strip())
     if not parsed:
         await message.answer(
@@ -1794,7 +1789,9 @@ async def process_manual_input_mode(message: Message, state: FSMContext) -> None
         "photo_file_id": None,
         "parsed": parsed,
         "mrz_lines": None,
+        "passport_hash": None,
         "ocr_source": "manual_input",
+        "manual_override": True,
         "ocr_confidence": "manual",
         "ocr_quality": session.get("passport_quality", {}),
         "ocr_blur": None,
@@ -1807,6 +1804,15 @@ async def process_manual_input_mode(message: Message, state: FSMContext) -> None
     passports.sort(key=lambda x: x["index"])
     session["passports"] = passports
     await state.update_data(session=session)
+
+    metrics.inc("ocr.manual_input")
+    logger.info(
+        "MANUAL_INPUT_USED",
+        extra={
+            "correlation_id": correlation_id,
+            "passport_index": passport_index,
+        },
+    )
 
     await _go_to_step(
         message,
