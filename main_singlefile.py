@@ -2042,7 +2042,6 @@ from typing import Any
 
 import boto3
 import cv2
-import easyocr
 import numpy as np
 import pytesseract
 import requests
@@ -2088,6 +2087,19 @@ DOWNLOADS_DIR.mkdir(parents=True, exist_ok=True)
 
 OCR_MIN_EASYOCR_LEN = _int_env("OCR_MIN_EASYOCR_LEN", 40)
 OCR_SKIP_VISION_IF_LEN = _int_env("OCR_SKIP_VISION_IF_LEN", 60)
+
+# Enterprise OCR config (use existing values if present)
+OCR_MIN_EASYOCR_LEN = globals().get("OCR_MIN_EASYOCR_LEN", OCR_MIN_EASYOCR_LEN if "OCR_MIN_EASYOCR_LEN" in globals() else 30)
+OCR_SKIP_VISION_IF_LEN = globals().get("OCR_SKIP_VISION_IF_LEN", OCR_SKIP_VISION_IF_LEN if "OCR_SKIP_VISION_IF_LEN" in globals() else 100)
+
+# Yandex config safeguards
+YANDEX_VISION_API_KEY = globals().get("YANDEX_VISION_API_KEY") or os.getenv("YANDEX_VISION_API_KEY")
+YANDEX_VISION_FOLDER_ID = globals().get("YANDEX_VISION_FOLDER_ID") or os.getenv("YANDEX_VISION_FOLDER_ID")
+YANDEX_VISION_ENDPOINT = globals().get("YANDEX_VISION_ENDPOINT", "https://vision.api.cloud.yandex.net/vision/v1/batchAnalyze")
+YANDEX_VISION_ENABLED = bool(YANDEX_VISION_API_KEY or YANDEX_VISION_FOLDER_ID)
+YANDEX_VISION_RETRY = int(os.getenv("YANDEX_VISION_RETRY", "2"))
+YANDEX_VISION_TIMEOUT = float(os.getenv("YANDEX_VISION_TIMEOUT", "10"))
+YANDEX_VISION_BACKOFF_BASE = float(os.getenv("YANDEX_VISION_BACKOFF_BASE", "0.5"))
 
 BITRIX_DEAL_FIELDS = {
     "surname": "UF_CRM_PASSPORT_SURNAME",
@@ -2286,77 +2298,251 @@ def parse_td3_mrz(line1: str, line2: str) -> dict[str, Any]:
     return data
 
 
-# =========================
-# OCR functions
-# =========================
-_reader: easyocr.Reader | None = None
-YANDEX_VISION_ENDPOINT = "https://vision.api.cloud.yandex.net/vision/v1/batchAnalyze"
+# ==== Begin: ocr_fallback (enterprise) ====
+import threading
+import time
+import random
+import json
+from typing import List, Optional
+
+# Optional imports handled gracefully
+try:
+    import easyocr
+except Exception:
+    easyocr = None
+try:
+    import numpy as np
+except Exception:
+    np = None
+try:
+    from PIL import Image
+except Exception:
+    Image = None
+
+# Optional metrics (use if prometheus_client available)
+try:
+    from prometheus_client import Counter, Histogram
+    METRICS_ENABLED = True
+    METRICS_EASYOCR_CALLS = Counter("ocr_easyocr_calls_total", "EasyOCR calls")
+    METRICS_VISION_CALLS = Counter("ocr_vision_calls_total", "Vision API calls")
+    METRICS_EASYOCR_TIME = Histogram("ocr_easyocr_duration_seconds", "EasyOCR duration")
+    METRICS_VISION_TIME = Histogram("ocr_vision_duration_seconds", "Vision API duration")
+except Exception:
+    METRICS_ENABLED = False
+
+_logger = logging.getLogger(__name__)
+
+# Thread-safe lazy singleton for EasyOCR reader
+_easyocr_reader_lock = threading.Lock()
+_easyocr_reader = None
 
 
-def _get_easyocr_reader() -> easyocr.Reader:
-    global _reader
-    if _reader is None:
-        _reader = easyocr.Reader(["en"])
-    return _reader
+def _get_easyocr_reader(langs: List[str] = ["en"]) -> Optional[object]:
+    global _easyocr_reader
+    if _easyocr_reader is not None:
+        return _easyocr_reader
+    if easyocr is None:
+        _logger.warning("[OCR][EasyOCR] easyocr not installed")
+        return None
+    with _easyocr_reader_lock:
+        if _easyocr_reader is not None:
+            return _easyocr_reader
+        try:
+            # initialize reader (let easyocr choose device)
+            _easyocr_reader = easyocr.Reader(langs)
+            _logger.info("[OCR][EasyOCR] initialized reader langs=%s", langs)
+        except Exception as e:
+            _logger.exception("[OCR][EasyOCR] init failed: %s", e)
+            _easyocr_reader = None
+        return _easyocr_reader
 
 
 def easyocr_extract_text(image_bytes: bytes) -> str:
-    image = Image.open(io.BytesIO(image_bytes)).convert("RGB")
-    image_np = np.array(image)
+    """
+    Enterprise EasyOCR wrapper:
+    - lazy reader
+    - convert bytes -> PIL -> numpy
+    - call reader.readtext(...)
+    - join texts
+    - metrics & detailed logging
+    """
+    _logger.info("[OCR][EasyOCR] fallback started")
+    start = time.time()
+    if METRICS_ENABLED:
+        METRICS_EASYOCR_CALLS.inc()
+    reader = _get_easyocr_reader(["en"])
+    if reader is None:
+        _logger.info("[OCR][EasyOCR] reader unavailable, returning empty string")
+        return ""
+    if Image is None or np is None:
+        _logger.warning("[OCR][EasyOCR] PIL or numpy missing")
+        return ""
+    try:
+        pil = Image.open(io.BytesIO(image_bytes)).convert("RGB")
+        img_np = np.array(pil)
+        # detail=1 returns (bbox, text, conf); paragraph=False to avoid auto-joining
+        results = reader.readtext(img_np, detail=1, paragraph=False)
+        texts = []
+        for r in results:
+            if isinstance(r, (list, tuple)):
+                if len(r) >= 2 and r[1]:
+                    texts.append(str(r[1]))
+                elif len(r) == 1:
+                    texts.append(str(r[0]))
+            elif isinstance(r, dict) and "text" in r:
+                texts.append(str(r.get("text", "")))
+            else:
+                texts.append(str(r))
+        joined = " ".join([t.strip() for t in texts if t and t.strip()])
+        duration = time.time() - start
+        _logger.info("[OCR][EasyOCR] done len=%d boxes=%d dur=%.3fs", len(joined), len(results), duration)
+        if METRICS_ENABLED:
+            METRICS_EASYOCR_TIME.observe(duration)
+        return joined
+    except Exception as e:
+        _logger.exception("[OCR][EasyOCR] readtext failed: %s", e)
+        return ""
 
-    reader = _get_easyocr_reader()
-    result = reader.readtext(image_np)
-    texts = [item[1] for item in result if len(item) > 1 and item[1]]
-    joined_text = " ".join(texts).strip()
 
-    logger.info("[OCR] EasyOCR boxes=%s text_len=%s", len(result), len(joined_text))
-    return joined_text
+# Robust Yandex Vision OCR wrapper with retries/backoff
+def _sleep_backoff(attempt: int):
+    # exponential backoff with jitter
+    base = float(globals().get("YANDEX_VISION_BACKOFF_BASE", 0.5))
+    sleep_for = base * (2 ** attempt) + random.uniform(0, base)
+    time.sleep(sleep_for)
+
+
+def _parse_yandex_vision_response(resp_json: dict) -> str:
+    """
+    Try several known response shapes:
+      - batchAnalyze -> results -> results -> textDetection -> pages -> blocks -> lines -> words
+      - ocr/recognizeText -> results -> pages -> blocks -> lines -> words
+    """
+    texts = []
+    # Try batchAnalyze shape
+    for top in resp_json.get("results", []) or []:
+        for sub in top.get("results", []) or []:
+            # nested object might be textDetection or text_detection
+            td = sub.get("textDetection") or sub.get("text_detection") or sub.get("ocr") or {}
+            pages = td.get("pages") or td.get("pages", []) or []
+            for page in pages:
+                for block in page.get("blocks", []) or []:
+                    for line in block.get("lines", []) or []:
+                        # words may be dicts with 'text'
+                        words = []
+                        for w in line.get("words", []) or []:
+                            if isinstance(w, dict):
+                                t = w.get("text") or w.get("word") or ""
+                                if t:
+                                    words.append(t)
+                            else:
+                                # some shapes might have direct strings
+                                words.append(str(w))
+                        if words:
+                            texts.append(" ".join(words))
+    # fallback: sometimes API returns top-level 'text' or 'fullTextAnnotation'
+    if not texts:
+        if "text" in resp_json and isinstance(resp_json["text"], str):
+            texts.append(resp_json["text"])
+        if "fullTextAnnotation" in resp_json:
+            # try to extract paragraphs/blocks
+            fta = resp_json["fullTextAnnotation"]
+            if isinstance(fta, dict):
+                for page in fta.get("pages", []) or []:
+                    for block in page.get("blocks", []) or []:
+                        for paragraph in block.get("paragraphs", []) or []:
+                            line_texts = []
+                            for word in paragraph.get("words", []) or []:
+                                sym_texts = [s.get("text", "") for s in (word.get("symbols", []) or [])]
+                                if sym_texts:
+                                    line_texts.append("".join(sym_texts))
+                            if line_texts:
+                                texts.append(" ".join(line_texts))
+    return " ".join([t.strip() for t in texts if t and t.strip()])
 
 
 def yandex_vision_extract_text(image_bytes: bytes) -> str:
-    if not YANDEX_VISION_API_KEY or not YANDEX_VISION_FOLDER_ID:
-        logger.info("[OCR] Yandex Vision credentials are not configured")
+    """
+    Yandex Vision API call with:
+      - retries (YANDEX_VISION_RETRY)
+      - timeout (YANDEX_VISION_TIMEOUT)
+      - optional Api-Key (Authorization: Api-Key ...)
+      - support for multiple response shapes
+    Returns '' on any fatal error or if credentials missing.
+    """
+    if not globals().get("YANDEX_VISION_ENABLED", False):
+        _logger.info("[OCR][Vision] disabled (no creds)")
         return ""
-
-    content = base64.b64encode(image_bytes).decode("utf-8")
-    payload = {
-        "folderId": YANDEX_VISION_FOLDER_ID,
+    api_key = globals().get("YANDEX_VISION_API_KEY")
+    folder = globals().get("YANDEX_VISION_FOLDER_ID")
+    endpoint = globals().get("YANDEX_VISION_ENDPOINT", "")
+    if not endpoint:
+        endpoint = "https://vision.api.cloud.yandex.net/vision/v1/batchAnalyze"
+    payload_template = {
         "analyze_specs": [
             {
-                "content": content,
-                "features": [{"type": "TEXT_DETECTION", "text_detection_config": {"languageCodes": ["en"]}}],
+                # content will be filled per request
+                "content": None,
+                "features": [
+                    {
+                        "type": "TEXT_DETECTION",
+                        "text_detection_config": {
+                            "language_codes": ["en"]
+                        }
+                    }
+                ],
             }
-        ],
+        ]
     }
-    headers = {"Authorization": f"Api-Key {YANDEX_VISION_API_KEY}", "Content-Type": "application/json"}
 
-    try:
-        response = requests.post(YANDEX_VISION_ENDPOINT, json=payload, headers=headers, timeout=20)
-        response.raise_for_status()
-    except requests.RequestException:
-        logger.exception("[OCR] Yandex Vision request failed")
-        return ""
+    headers = {"Content-Type": "application/json"}
+    if api_key:
+        headers["Authorization"] = f"Api-Key {api_key}"
+    if folder:
+        # some endpoints expect folderId in payload, some expect x-folder-id header
+        headers["x-folder-id"] = folder
 
-    words: list[str] = []
-    for analyzed in response.json().get("results", []):
-        for result in analyzed.get("results", []):
-            text_detection = result.get("textDetection", {})
-            for page in text_detection.get("pages", []):
-                for block in page.get("blocks", []):
-                    for line in block.get("lines", []):
-                        for word in line.get("words", []):
-                            text = word.get("text")
-                            if text:
-                                words.append(text)
-
-    extracted_text = " ".join(words).strip()
-    logger.info("[OCR] Yandex Vision text_len=%s", len(extracted_text))
-    return extracted_text
+    b64 = base64.b64encode(image_bytes).decode("utf-8")
+    payload = payload_template.copy()
+    payload["analyze_specs"][0]["content"] = b64
+    retry = int(globals().get("YANDEX_VISION_RETRY", 2))
+    timeout = float(globals().get("YANDEX_VISION_TIMEOUT", 10))
+    for attempt in range(retry + 1):
+        try:
+            if METRICS_ENABLED:
+                METRICS_VISION_CALLS.inc()
+            _logger.debug("[OCR][Vision] calling endpoint=%s attempt=%d", endpoint, attempt)
+            t0 = time.time()
+            r = requests.post(endpoint, data=json.dumps(payload), headers=headers, timeout=timeout)
+            r.raise_for_status()
+            dur = time.time() - t0
+            if METRICS_ENABLED:
+                METRICS_VISION_TIME.observe(dur)
+            _logger.debug("[OCR][Vision] http status=%s dur=%.3f", r.status_code, dur)
+            j = r.json()
+            text = _parse_yandex_vision_response(j)
+            _logger.info("[OCR][Vision] text_len=%d", len(text))
+            # TODO: add circuit-breaker cooldown integration for persistent upstream failures.
+            return text
+        except requests.RequestException as re:
+            _logger.warning("[OCR][Vision] request failed attempt=%d: %s", attempt, re)
+            if attempt < retry:
+                _sleep_backoff(attempt)
+                continue
+            _logger.exception("[OCR][Vision] final failure: %s", re)
+            return ""
+        except Exception as e:
+            _logger.exception("[OCR][Vision] unexpected error: %s", e)
+            return ""
+# ==== End: ocr_fallback (enterprise) ====
 
 
 def ocr_pipeline_extract(img_bytes: bytes) -> dict[str, Any]:
+    # existing code: extract MRZ lines as before
     line1, line2, mrz_text, _mode = extract_mrz_from_image_bytes(img_bytes)
     if line1 and line2:
+        # preserve exact previous behavior: return MRZ as source if MRZ exists
+        logger.info("MRZ found")
         parsed = parse_td3_mrz(line1, line2)
         checksum_ok = parsed.get("_mrz_checksum_ok", False)
         confidence = "high" if checksum_ok else "medium"
@@ -2368,11 +2554,25 @@ def ocr_pipeline_extract(img_bytes: bytes) -> dict[str, Any]:
             "mrz_lines": (line1, line2),
         }
 
-    text = extract_text_from_image_bytes(img_bytes)
-    logger.info("[OCR] Tesseract text_len=%s", len(text or ""))
+    # No MRZ — use Tesseract first (existing)
+    text_from_tesseract = extract_text_from_image_bytes(img_bytes)  # preserve existing function
+    logger.info("[OCR] Tesseract text_len=%d", len(text_from_tesseract or ""))
 
-    easy_text = easyocr_extract_text(img_bytes)
-    if easy_text and len(easy_text) > OCR_MIN_EASYOCR_LEN:
+    # Run EasyOCR as primary local fallback
+    logger.info("MRZ not found — running EasyOCR")
+    try:
+        easy_text = easyocr_extract_text(img_bytes)
+    except Exception:
+        logger.exception("EasyOCR fallback failed")
+        easy_text = ""
+
+    # Determine if EasyOCR output is sufficient per existing config
+    min_len = int(globals().get("OCR_MIN_EASYOCR_LEN", OCR_MIN_EASYOCR_LEN))
+    skip_vision_if_len = int(globals().get("OCR_SKIP_VISION_IF_LEN", OCR_SKIP_VISION_IF_LEN))
+
+    # If easy_text meets threshold -> accept it
+    if easy_text and len(easy_text.strip()) >= min_len:
+        logger.info("[OCR] EasyOCR accepted len=%d", len(easy_text.strip()))
         return {
             "text": easy_text,
             "source": "easyocr",
@@ -2381,22 +2581,49 @@ def ocr_pipeline_extract(img_bytes: bytes) -> dict[str, Any]:
             "mrz_lines": None,
         }
 
-    vision_text = ""
-    if len((easy_text or text).strip()) < OCR_SKIP_VISION_IF_LEN:
-        vision_text = yandex_vision_extract_text(img_bytes)
-
-    if vision_text:
+    # If easy_text is weak or empty decide whether to call Vision
+    # If tesseract/easy combined already long enough to skip vision, keep tesseract
+    combined_len = len((easy_text or "") + (text_from_tesseract or ""))
+    if combined_len >= skip_vision_if_len:
+        # prefer longer of easy_text and tesseract
+        preferred = easy_text if (easy_text and len(easy_text) > len(text_from_tesseract or "")) else (text_from_tesseract or "")
+        src = "easyocr" if preferred == easy_text and easy_text else "tesseract"
+        logger.info("[OCR] Skipping Vision (combined_len=%d >= %d) -> source=%s", combined_len, skip_vision_if_len, src)
         return {
-            "text": vision_text,
-            "source": "vision",
-            "confidence": "medium",
+            "text": preferred,
+            "source": src,
+            "confidence": "low",
             "parsed": {},
             "mrz_lines": None,
         }
 
+    # Otherwise escalate to Yandex Vision if enabled
+    if globals().get("YANDEX_VISION_ENABLED", False):
+        logger.info("EasyOCR weak — running Vision API")
+        try:
+            vision_text = yandex_vision_extract_text(img_bytes)
+        except Exception:
+            logger.exception("Vision fallback failed")
+            vision_text = ""
+    else:
+        logger.info("Vision disabled or no creds; skipping Vision API")
+        vision_text = ""
+
+    # Choose best available: prioritize non-empty and longer text
+    candidates = [
+        ("vision", vision_text or ""),
+        ("easyocr", easy_text or ""),
+        ("tesseract", text_from_tesseract or ""),
+    ]
+    # select longest non-empty
+    chosen_source, chosen_text = max(candidates, key=lambda kv: len(kv[1]))
+    if not chosen_text:
+        chosen_text = ""
+        chosen_source = "tesseract"
+    logger.info("[OCR] final source=%s len=%d", chosen_source, len(chosen_text))
     return {
-        "text": easy_text or text or "",
-        "source": "tesseract",
+        "text": chosen_text,
+        "source": chosen_source,
         "confidence": "low",
         "parsed": {},
         "mrz_lines": None,
